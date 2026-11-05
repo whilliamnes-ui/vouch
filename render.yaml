@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-discord-vouch-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: ALLOWED_CHAT_ID
+        sync: false
+      - key: DISCORD_BOT_USERNAME
+        value: Vouch Bot
