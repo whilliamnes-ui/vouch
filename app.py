@@ -57,6 +57,8 @@ RUNTIME_TELEGRAM_CHAT_ID = ALLOWED_CHAT_ID
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
 LAST_DISCORD_MESSAGE_ID = None
 POLLER_LOCK = threading.Lock()
+WORKER_START_LOCK = threading.Lock()
+WORKERS_STARTED_PID = None
 
 # Background queue for outgoing Telegram -> Discord vouches to prevent burst 429s
 DISCORD_SEND_QUEUE = queue.Queue()
@@ -74,6 +76,113 @@ def redact_secrets(text: str) -> str:
     if TELEGRAM_BOT_TOKEN:
         masked = masked.replace(TELEGRAM_BOT_TOKEN, "[REDACTED_TG_TOKEN]")
     return masked
+
+
+def discord_headers() -> dict:
+    return {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "User-Agent": USER_AGENT,
+    }
+
+
+def auto_discover_discord_channel_id():
+    """
+    If DISCORD_CHANNEL_ID was not manually set in Render, automatically fetches
+    the channel_id from the DISCORD_WEBHOOK_URL metadata or via DISCORD_BOT_TOKEN.
+    """
+    global DISCORD_CHANNEL_ID, DISCORD_GUILD_ID
+    if DISCORD_CHANNEL_ID and DISCORD_GUILD_ID:
+        return
+
+    # 1. Try extracting webhook_id from DISCORD_WEBHOOK_URL and querying with Bot Token
+    m = re.search(r"discord(?:app)?\.com/api/webhooks/(\d+)/([^\s/?#]+)", DISCORD_WEBHOOK_URL)
+    if m and DISCORD_BOT_TOKEN:
+        webhook_id = m.group(1)
+        try:
+            r = requests.get(
+                f"{DISCORD_API_BASE}/webhooks/{webhook_id}",
+                headers=discord_headers(),
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if not DISCORD_CHANNEL_ID and data.get("channel_id"):
+                    DISCORD_CHANNEL_ID = str(data["channel_id"])
+                if not DISCORD_GUILD_ID and data.get("guild_id"):
+                    DISCORD_GUILD_ID = str(data["guild_id"])
+                if DISCORD_CHANNEL_ID:
+                    logger.info(
+                        f"Auto-discovered DISCORD_CHANNEL_ID={DISCORD_CHANNEL_ID} "
+                        f"(guild_id={DISCORD_GUILD_ID}) via Bot Token + Webhook ID."
+                    )
+                    return
+        except Exception as exc:
+            logger.warning(f"Webhook metadata lookup via Bot Token failed: {redact_secrets(str(exc))}")
+
+    # 2. Fallback: query the webhook URL directly (GET on webhook URL returns its channel_id and guild_id)
+    if DISCORD_WEBHOOK_URL:
+        try:
+            r = requests.get(DISCORD_WEBHOOK_URL, headers={"User-Agent": USER_AGENT}, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if not DISCORD_CHANNEL_ID and data.get("channel_id"):
+                    DISCORD_CHANNEL_ID = str(data["channel_id"])
+                if not DISCORD_GUILD_ID and data.get("guild_id"):
+                    DISCORD_GUILD_ID = str(data["guild_id"])
+                if DISCORD_CHANNEL_ID:
+                    logger.info(
+                        f"Auto-discovered DISCORD_CHANNEL_ID={DISCORD_CHANNEL_ID} "
+                        f"(guild_id={DISCORD_GUILD_ID}) directly from DISCORD_WEBHOOK_URL."
+                    )
+        except Exception as exc:
+            logger.warning(f"Direct webhook metadata lookup failed: {redact_secrets(str(exc))}")
+
+
+def ensure_background_workers_running():
+    """
+    Ensures background threads are started INSIDE the forked Gunicorn worker process
+    (even when Gunicorn uses --preload or forks worker processes after module import).
+    """
+    global WORKERS_STARTED_PID
+    current_pid = os.getpid()
+    if WORKERS_STARTED_PID == current_pid:
+        return
+
+    with WORKER_START_LOCK:
+        if WORKERS_STARTED_PID == current_pid:
+            return
+
+        auto_discover_discord_channel_id()
+        register_telegram_webhook()
+
+        sender_thread = threading.Thread(
+            target=discord_sender_worker,
+            name=f"discord-sender-{current_pid}",
+            daemon=True,
+        )
+        sender_thread.start()
+
+        if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
+            poller_thread = threading.Thread(
+                target=discord_poller_loop,
+                name=f"discord-poller-{current_pid}",
+                daemon=True,
+            )
+            poller_thread.start()
+        else:
+            logger.info(
+                f"[PID {current_pid}] DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID missing "
+                f"(bot_token={bool(DISCORD_BOT_TOKEN)}, channel_id={DISCORD_CHANNEL_ID or 'unset'}); "
+                f"running Telegram -> Discord only."
+            )
+
+        WORKERS_STARTED_PID = current_pid
+        logger.info(f"[PID {current_pid}] Background worker threads are active.")
+
+
+@app.before_request
+def _boot_workers_on_first_request():
+    ensure_background_workers_running()
 
 
 def remember_in_cache(cache: OrderedDict, key):
@@ -234,14 +343,9 @@ def build_multipart_files(raw_attachments: list[tuple[str, str, bytes]]) -> dict
 
 
 def extract_retry_after(resp: requests.Response, attempt: int) -> tuple[float, str]:
-    """
-    Parses Discord's 429 response to determine exact wait time and whether it is
-    a bucket limit, global limit, or Cloudflare IP rate limit (Error 1015).
-    """
     scope = resp.headers.get("X-RateLimit-Scope", "unknown")
     retry_after = None
 
-    # 1. Try JSON body {"retry_after": 1.23, "global": false}
     try:
         data = resp.json()
         if isinstance(data, dict) and "retry_after" in data:
@@ -251,7 +355,6 @@ def extract_retry_after(resp: requests.Response, attempt: int) -> tuple[float, s
     except Exception:
         pass
 
-    # 2. Try HTTP Headers
     if retry_after is None:
         header_val = resp.headers.get("Retry-After") or resp.headers.get("X-RateLimit-Reset-After")
         if header_val:
@@ -260,7 +363,6 @@ def extract_retry_after(resp: requests.Response, attempt: int) -> tuple[float, s
             except ValueError:
                 pass
 
-    # 3. Check if Cloudflare HTML 1015 block (shared Render IP limit)
     body_preview = (resp.text or "")[:200].lower()
     if "cloudflare" in body_preview or "1015" in body_preview or "<!doctype html" in body_preview:
         scope = "cloudflare-shared-ip"
@@ -278,14 +380,27 @@ def post_to_discord_with_retry(
     author_name: str,
     discord_payload: dict,
     raw_attachments: list[tuple[str, str, bytes]],
-):
+) -> bool:
     """
-    Sends the embed payload to Discord with automatic 429 Retry-After handling,
-    fresh BytesIO streams per attempt, and automatic Bot API fallback if the
-    unauthenticated Webhook hits a shared-IP block on Render.
+    Delivers the vouch to Discord:
+    1. If DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID are available, sends directly via the
+       authenticated Discord Bot API first (completely immune to Render shared-IP webhook 429 bans).
+    2. Otherwise (or if Bot API fails), sends via DISCORD_WEBHOOK_URL with automatic 429 retry.
     """
+    auto_discover_discord_channel_id()
+
+    # Priority 1: Authenticated Discord Bot API (has its own isolated 50 req/sec bucket)
+    if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
+        if send_via_discord_bot_api(message_id, author_name, discord_payload, raw_attachments):
+            return True
+
+    # Priority 2: Discord Webhook URL with retry backoff
+    if not DISCORD_WEBHOOK_URL:
+        logger.error(f"Cannot send vouch #{message_id}: neither Bot API nor DISCORD_WEBHOOK_URL succeeded.")
+        return False
+
     headers = {"User-Agent": USER_AGENT}
-    max_attempts = 5
+    max_attempts = 4
 
     for attempt in range(max_attempts):
         try:
@@ -307,20 +422,15 @@ def post_to_discord_with_retry(
                 )
 
             if resp.status_code in (200, 204):
-                logger.info(f"Forwarded Telegram vouch #{message_id} from {author_name} to Discord.")
+                logger.info(f"Forwarded Telegram vouch #{message_id} from {author_name} to Discord via Webhook.")
                 return True
 
             if resp.status_code == 429:
                 wait_sec, scope = extract_retry_after(resp, attempt)
                 logger.warning(
                     f"Discord webhook 429 rate limit (scope={scope}, attempt={attempt + 1}/{max_attempts}) "
-                    f"for vouch #{message_id}. Waiting {wait_sec:.1f}s before retry..."
+                    f"for vouch #{message_id}. Waiting {wait_sec:.1f}s..."
                 )
-                # If Render's shared IP is blocked on unauthenticated webhooks and we have a Bot Token, try Bot API fallback
-                if scope in ("cloudflare-shared-ip", "global") and DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
-                    if send_via_discord_bot_fallback(message_id, author_name, discord_payload, raw_attachments):
-                        return True
-
                 time.sleep(wait_sec)
                 continue
 
@@ -334,23 +444,18 @@ def post_to_discord_with_retry(
             logger.error(f"Error sending vouch #{message_id} to Discord (attempt {attempt + 1}): {redact_secrets(str(exc))}")
             time.sleep(2.0)
 
-    # Final fallback via authenticated Bot API if all webhook retries were 429'd
-    if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
-        return send_via_discord_bot_fallback(message_id, author_name, discord_payload, raw_attachments)
-
     logger.error(f"Exhausted all retries for Telegram vouch #{message_id}.")
     return False
 
 
-def send_via_discord_bot_fallback(
+def send_via_discord_bot_api(
     message_id: int,
     author_name: str,
     discord_payload: dict,
     raw_attachments: list[tuple[str, str, bytes]],
 ) -> bool:
     """
-    Fallback sender that uses the authenticated Discord Bot Token (POST /channels/{id}/messages)
-    if the unauthenticated webhook URL is rate-limited on Render's shared IP.
+    Sends the vouch embed using the authenticated Discord Bot Token (POST /channels/{id}/messages).
     """
     try:
         bot_payload = {"embeds": discord_payload.get("embeds", [])}
@@ -376,19 +481,24 @@ def send_via_discord_bot_fallback(
             msg_data = resp.json()
             if msg_data.get("id"):
                 remember_in_cache(PROCESSED_DISCORD_IDS, str(msg_data["id"]))
-            logger.info(f"Forwarded Telegram vouch #{message_id} from {author_name} via Discord Bot API fallback.")
+            logger.info(f"Forwarded Telegram vouch #{message_id} from {author_name} to Discord via Bot API.")
             return True
+        else:
+            logger.warning(
+                f"Discord Bot API returned HTTP {resp.status_code} for vouch #{message_id}: "
+                f"{redact_secrets(resp.text[:250])}"
+            )
     except Exception as exc:
-        logger.warning(f"Discord Bot API fallback also failed for vouch #{message_id}: {redact_secrets(str(exc))}")
+        logger.warning(f"Discord Bot API send failed for vouch #{message_id}: {redact_secrets(str(exc))}")
     return False
 
 
 def discord_sender_worker():
     """
     Background worker that processes outgoing Discord embeds sequentially
-    with a 1.5s spacing delay so multi-message forwards never trigger Discord's 5/2s burst limit.
+    with a 1.5s spacing delay.
     """
-    logger.info("Started background Discord webhook sender queue worker.")
+    logger.info(f"[PID {os.getpid()}] Started background Discord sender queue worker.")
     while True:
         item = DISCORD_SEND_QUEUE.get()
         if item is None:
@@ -396,7 +506,6 @@ def discord_sender_worker():
         try:
             message_id, author_name, discord_payload, raw_attachments = item
             post_to_discord_with_retry(message_id, author_name, discord_payload, raw_attachments)
-            # Respect Discord's 5 requests / 2 seconds per-webhook bucket
             time.sleep(1.5)
         except Exception as exc:
             logger.error(f"Unexpected error in discord_sender_worker: {redact_secrets(str(exc))}")
@@ -407,13 +516,6 @@ def discord_sender_worker():
 # ==============================================================================
 # DISCORD -> TELEGRAM REVERSE SYNC HELPERS
 # ==============================================================================
-def discord_headers() -> dict:
-    return {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "User-Agent": USER_AGENT,
-    }
-
-
 def clean_discord_content(content: str, mentions: list) -> str:
     if not content:
         return ""
@@ -520,6 +622,7 @@ def send_discord_vouch_to_telegram(discord_msg: dict):
 
 def init_discord_poller_state() -> bool:
     global DISCORD_GUILD_ID, LAST_DISCORD_MESSAGE_ID
+    auto_discover_discord_channel_id()
     if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
         return False
 
@@ -557,7 +660,7 @@ def init_discord_poller_state() -> bool:
                 LAST_DISCORD_MESSAGE_ID = "0"
             logger.info(
                 f"Discord poller initialized (guild_id={DISCORD_GUILD_ID}, "
-                f"starting after message_id={LAST_DISCORD_MESSAGE_ID})"
+                f"channel_id={DISCORD_CHANNEL_ID}, starting after message_id={LAST_DISCORD_MESSAGE_ID})"
             )
             return True
         else:
@@ -635,7 +738,7 @@ def poll_discord_once():
 
 
 def discord_poller_loop():
-    logger.info(f"Starting Discord -> Telegram background poller (interval={DISCORD_POLL_INTERVAL}s)")
+    logger.info(f"[PID {os.getpid()}] Starting Discord -> Telegram background poller (interval={DISCORD_POLL_INTERVAL}s)")
     while True:
         poll_discord_once()
         time.sleep(max(10, DISCORD_POLL_INTERVAL))
@@ -650,7 +753,9 @@ def health_check():
     return jsonify({
         "status": "ok",
         "service": "telegram-discord-vouch-bridge",
+        "worker_pid": os.getpid(),
         "queue_size": DISCORD_SEND_QUEUE.qsize(),
+        "discord_channel_id": DISCORD_CHANNEL_ID or None,
         "discord_to_telegram_enabled": bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID),
     }), 200
 
@@ -755,7 +860,8 @@ def telegram_webhook():
     if DISCORD_BOT_AVATAR_URL:
         discord_payload["avatar_url"] = DISCORD_BOT_AVATAR_URL
 
-    # Enqueue for rate-limit-safe background delivery to Discord
+    # Ensure background threads exist in this worker PID, then enqueue
+    ensure_background_workers_running()
     DISCORD_SEND_QUEUE.put((message_id, author_name, discord_payload, raw_attachments))
     logger.info(f"Queued Telegram vouch #{message_id} from {author_name} for Discord delivery.")
 
@@ -779,21 +885,7 @@ def register_telegram_webhook():
         logger.warning(f"Could not auto-register Telegram webhook: {redact_secrets(str(exc))}")
 
 
-def start_background_services():
-    register_telegram_webhook()
-
-    sender_thread = threading.Thread(target=discord_sender_worker, daemon=True)
-    sender_thread.start()
-
-    if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID:
-        poller_thread = threading.Thread(target=discord_poller_loop, daemon=True)
-        poller_thread.start()
-    else:
-        logger.info("DISCORD_BOT_TOKEN or DISCORD_CHANNEL_ID not set; running Telegram -> Discord only.")
-
-
-start_background_services()
-
 if __name__ == "__main__":
+    ensure_background_workers_running()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
